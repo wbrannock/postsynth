@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +10,7 @@ from pydantic import BaseModel, ValidationError
 from postsynth.config import GenerationConfig, OpenRouterConfig, OutputConfig
 from postsynth.json_utils import parse_json_object
 from postsynth.llm import LLMClient, OpenRouterClient
+from postsynth.models import resolve_model_selection
 from postsynth.prompts import build_generation_messages, build_repair_messages
 from postsynth.schemas import DatasetKind, GeneratedItems, ROW_ADAPTERS
 from postsynth.writers import write_dataset_card, write_jsonl
@@ -34,7 +35,20 @@ class Synthesizer:
         llm_client: LLMClient | None = None,
         provider_config: OpenRouterConfig | None = None,
     ) -> None:
-        self.provider_config = provider_config or OpenRouterConfig()
+        config = provider_config or OpenRouterConfig()
+        if config.model_metadata is None:
+            selection = resolve_model_selection(
+                model=config.model if provider_config else None,
+                model_preset=None if provider_config else "default",
+            )
+            config = replace(
+                config,
+                model=selection.model,
+                requested_model=selection.requested,
+                model_source=selection.source,
+                model_metadata=selection.metadata(),
+            )
+        self.provider_config = config
         self.llm_client = llm_client or OpenRouterClient(self.provider_config)
 
     def generate(

@@ -62,6 +62,7 @@ def test_generate_sft_writes_jsonl_and_dataset_card(tmp_path: Path) -> None:
     assert "test/model" in card
     assert "secret" not in card
     assert "<redacted>" in card
+    assert "model_metadata" in card
 
 
 def test_invalid_rows_are_repaired(tmp_path: Path) -> None:

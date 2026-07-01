@@ -77,4 +77,3 @@ def _redact_provider_config(config: OpenRouterConfig) -> dict[str, Any]:
     data = asdict(config)
     data["api_key"] = "<redacted>" if config.api_key else None
     return data
-

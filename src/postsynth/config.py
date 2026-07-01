@@ -2,17 +2,23 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
+
+from postsynth.models import DEFAULT_MODEL_ID
 
 
 @dataclass(frozen=True)
 class OpenRouterConfig:
-    model: str = "openai/gpt-4o-mini"
+    model: str = DEFAULT_MODEL_ID
     api_key: str | None = None
     base_url: str = "https://openrouter.ai/api/v1"
     http_referer: str | None = None
     app_title: str = "postsynth"
     timeout_seconds: float = 60.0
     max_retries: int = 2
+    requested_model: str | None = None
+    model_source: str = "preset"
+    model_metadata: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -33,4 +39,3 @@ class GenerationConfig:
 class OutputConfig:
     path: Path
     write_dataset_card: bool = True
-

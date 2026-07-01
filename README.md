@@ -51,8 +51,51 @@ postsynth generate dpo \
   --out data/generated/dpo.jsonl
 ```
 
+By default, postsynth uses the pinned OpenRouter model
+`google/gemini-3.5-flash-20260519` for reproducibility. Use a preset:
+
+```bash
+postsynth generate sft \
+  --seed "Math tutoring conversations." \
+  --model-preset cheap \
+  --count 100 \
+  --out data/generated/sft.jsonl
+```
+
+Or pass an explicit OpenRouter model slug:
+
+```bash
+postsynth generate sft \
+  --seed "Math tutoring conversations." \
+  --model google/gemini-3.5-flash \
+  --count 100 \
+  --out data/generated/sft.jsonl
+```
+
+Floating OpenRouter aliases such as `~google/gemini-flash-latest` are blocked by
+default because they are less reproducible. To use one intentionally:
+
+```bash
+postsynth generate sft \
+  --seed "Math tutoring conversations." \
+  --model-preset latest-gemini-flash \
+  --allow-floating-model \
+  --count 100 \
+  --out data/generated/sft.jsonl
+```
+
+Inspect available presets and OpenRouter models:
+
+```bash
+postsynth models presets
+postsynth models list --provider google --text-only
+postsynth models show google/gemini-3.5-flash
+```
+
 The CLI writes a JSONL dataset and a sibling dataset card, for example
-`sft.dataset.md`, with non-secret generation metadata.
+`sft.dataset.md`, with non-secret generation metadata including requested model,
+resolved model, model source, floating-model status, and catalog metadata when
+available.
 
 ## Python API
 
