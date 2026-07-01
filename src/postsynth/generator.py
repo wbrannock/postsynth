@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from pydantic import BaseModel, ValidationError
 
@@ -26,6 +26,9 @@ class GenerationResult:
     repair_attempted: int
     repair_succeeded: int
     dropped_rows: int
+    batches_attempted: int
+    incomplete: bool
+    batch_diagnostics: list[dict[str, Any]]
 
 
 class Synthesizer:
@@ -59,26 +62,70 @@ class Synthesizer:
         examples: list[dict[str, Any]] | None = None,
         generation_config: GenerationConfig,
         output_config: OutputConfig,
+        progress_callback: Callable[[int], None] | None = None,
     ) -> GenerationResult:
         _validate_source(seed=seed, examples=examples)
         source_mode = "seed" if seed is not None else "examples"
-        messages = build_generation_messages(
-            kind,
-            count=generation_config.count,
-            seed=seed,
-            examples=examples,
+        rows: list[BaseModel] = []
+        stats = {
+            "invalid_rows": 0,
+            "repair_attempted": 0,
+            "repair_succeeded": 0,
+            "dropped_rows": 0,
+            "batches_attempted": 0,
+            "incomplete": 0,
+        }
+        batch_diagnostics: list[dict[str, Any]] = []
+        max_batches = generation_config.max_batches or _default_max_batches(
+            generation_config.count,
+            generation_config.batch_size,
         )
-        response = self.llm_client.complete(
-            messages,
-            model=self.provider_config.model,
-            temperature=generation_config.temperature,
-            max_tokens=generation_config.max_tokens,
-        )
-        rows, stats = self._parse_validate_repair(
-            kind,
-            response=response,
-            generation_config=generation_config,
-        )
+
+        while len(rows) < generation_config.count and stats["batches_attempted"] < max_batches:
+            remaining = generation_config.count - len(rows)
+            batch_count = min(remaining, generation_config.batch_size)
+            batch_config = replace(generation_config, count=batch_count)
+            batch_index = stats["batches_attempted"] + 1
+            messages = build_generation_messages(
+                kind,
+                count=batch_count,
+                seed=seed,
+                examples=examples,
+            )
+            response = self.llm_client.complete(
+                messages,
+                model=self.provider_config.model,
+                temperature=generation_config.temperature,
+                max_tokens=generation_config.max_tokens,
+            )
+            batch_rows, batch_stats = self._parse_validate_repair(
+                kind,
+                response=response,
+                generation_config=batch_config,
+            )
+            rows.extend(batch_rows)
+            for key in ("invalid_rows", "repair_attempted", "repair_succeeded", "dropped_rows"):
+                stats[key] += batch_stats[key]
+            stats["batches_attempted"] += 1
+            batch_diagnostics.append(
+                {
+                    "batch": batch_index,
+                    "requested": batch_count,
+                    "accepted": len(batch_rows),
+                    "dropped": batch_stats["dropped_rows"],
+                    "invalid_rows": batch_stats["invalid_rows"],
+                    "repair_attempted": batch_stats["repair_attempted"],
+                    "repair_succeeded": batch_stats["repair_succeeded"],
+                    "error_stage": batch_stats["error_stage"],
+                    "error_summary": batch_stats["error_summary"],
+                }
+            )
+            if progress_callback:
+                progress_callback(len(batch_rows))
+
+        rows = rows[: generation_config.count]
+        if len(rows) < generation_config.count:
+            stats["incomplete"] = 1
         write_jsonl(output_config.path, rows)
         if output_config.write_dataset_card:
             write_dataset_card(
@@ -89,6 +136,7 @@ class Synthesizer:
                 provider_config=self.provider_config,
                 generation_config=generation_config,
                 validation_stats=stats,
+                batch_diagnostics=batch_diagnostics,
             )
         return GenerationResult(
             kind=kind,
@@ -99,6 +147,9 @@ class Synthesizer:
             repair_attempted=stats["repair_attempted"],
             repair_succeeded=stats["repair_succeeded"],
             dropped_rows=stats["dropped_rows"],
+            batches_attempted=stats["batches_attempted"],
+            incomplete=bool(stats["incomplete"]),
+            batch_diagnostics=batch_diagnostics,
         )
 
     def _parse_validate_repair(
@@ -107,7 +158,7 @@ class Synthesizer:
         *,
         response: str,
         generation_config: GenerationConfig,
-    ) -> tuple[list[BaseModel], dict[str, int]]:
+    ) -> tuple[list[BaseModel], dict[str, Any]]:
         rows, invalid = _parse_and_validate_rows(kind, response)
         repair_attempted = 0
         repair_succeeded = 0
@@ -136,6 +187,8 @@ class Synthesizer:
             "repair_attempted": repair_attempted,
             "repair_succeeded": repair_succeeded,
             "dropped_rows": dropped_rows,
+            "error_stage": _error_stage(invalid),
+            "error_summary": _error_summary(invalid),
         }
         return rows, stats
 
@@ -146,6 +199,8 @@ def generate_sft(
     examples: list[dict[str, Any]] | None = None,
     output_path: str | Path,
     count: int,
+    batch_size: int = 25,
+    max_batches: int | None = None,
     provider_config: OpenRouterConfig | None = None,
     llm_client: LLMClient | None = None,
 ) -> GenerationResult:
@@ -155,6 +210,8 @@ def generate_sft(
         examples=examples,
         output_path=output_path,
         count=count,
+        batch_size=batch_size,
+        max_batches=max_batches,
         provider_config=provider_config,
         llm_client=llm_client,
     )
@@ -166,6 +223,8 @@ def generate_dpo(
     examples: list[dict[str, Any]] | None = None,
     output_path: str | Path,
     count: int,
+    batch_size: int = 25,
+    max_batches: int | None = None,
     provider_config: OpenRouterConfig | None = None,
     llm_client: LLMClient | None = None,
 ) -> GenerationResult:
@@ -175,6 +234,8 @@ def generate_dpo(
         examples=examples,
         output_path=output_path,
         count=count,
+        batch_size=batch_size,
+        max_batches=max_batches,
         provider_config=provider_config,
         llm_client=llm_client,
     )
@@ -186,6 +247,8 @@ def generate_grpo(
     examples: list[dict[str, Any]] | None = None,
     output_path: str | Path,
     count: int,
+    batch_size: int = 25,
+    max_batches: int | None = None,
     provider_config: OpenRouterConfig | None = None,
     llm_client: LLMClient | None = None,
 ) -> GenerationResult:
@@ -195,6 +258,8 @@ def generate_grpo(
         examples=examples,
         output_path=output_path,
         count=count,
+        batch_size=batch_size,
+        max_batches=max_batches,
         provider_config=provider_config,
         llm_client=llm_client,
     )
@@ -206,6 +271,8 @@ def generate_kto(
     examples: list[dict[str, Any]] | None = None,
     output_path: str | Path,
     count: int,
+    batch_size: int = 25,
+    max_batches: int | None = None,
     provider_config: OpenRouterConfig | None = None,
     llm_client: LLMClient | None = None,
 ) -> GenerationResult:
@@ -215,6 +282,8 @@ def generate_kto(
         examples=examples,
         output_path=output_path,
         count=count,
+        batch_size=batch_size,
+        max_batches=max_batches,
         provider_config=provider_config,
         llm_client=llm_client,
     )
@@ -227,6 +296,8 @@ def _generate_kind(
     examples: list[dict[str, Any]] | None,
     output_path: str | Path,
     count: int,
+    batch_size: int,
+    max_batches: int | None,
     provider_config: OpenRouterConfig | None,
     llm_client: LLMClient | None,
 ) -> GenerationResult:
@@ -235,7 +306,11 @@ def _generate_kind(
         kind,
         seed=seed,
         examples=examples,
-        generation_config=GenerationConfig(count=count),
+        generation_config=GenerationConfig(
+            count=count,
+            batch_size=batch_size,
+            max_batches=max_batches,
+        ),
         output_config=OutputConfig(path=Path(output_path)),
     )
 
@@ -285,3 +360,25 @@ def _format_invalid_rows(invalid: list[tuple[int, str]]) -> str:
         ensure_ascii=False,
         indent=2,
     )
+
+
+def _default_max_batches(count: int, batch_size: int) -> int:
+    expected_batches = (count + batch_size - 1) // batch_size
+    return max(expected_batches + 3, expected_batches * 3)
+
+
+def _error_stage(invalid: list[tuple[int, str]]) -> str | None:
+    if not invalid:
+        return None
+    if invalid[0][0] == -1:
+        return "response_schema"
+    return "row_schema"
+
+
+def _error_summary(invalid: list[tuple[int, str]]) -> str | None:
+    if not invalid:
+        return None
+    summary = invalid[0][1].replace("\n", " ")
+    if len(summary) > 300:
+        return summary[:297] + "..."
+    return summary

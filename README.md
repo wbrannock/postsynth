@@ -39,6 +39,8 @@ Generate from a seed instruction:
 postsynth generate sft \
   --seed "Customer-support chats about subscription billing." \
   --count 100 \
+  --batch-size 25 \
+  --max-batches 20 \
   --out data/generated/sft.jsonl
 ```
 
@@ -97,6 +99,17 @@ The CLI writes a JSONL dataset and a sibling dataset card, for example
 resolved model, model source, floating-model status, and catalog metadata when
 available.
 
+Large generations run in batches and show a tqdm progress bar by default. The
+progress bar advances when valid rows are accepted, not merely when a request
+finishes. If a batch returns malformed JSON or too few valid rows, postsynth keeps
+requesting fill batches until it reaches `--count` or exhausts the attempt
+budget.
+
+Tune request size with `--batch-size`, cap total model calls with
+`--max-batches`, or disable progress output in scripts with `--no-progress`.
+Dataset cards include aggregate validation stats and per-batch diagnostics so
+you can see which batches were accepted, repaired, dropped, or left incomplete.
+
 ## Python API
 
 ```python
@@ -105,6 +118,7 @@ from postsynth import generate_sft
 result = generate_sft(
     seed="Math tutoring conversations for middle-school students.",
     count=25,
+    batch_size=5,
     output_path="data/generated/math_sft.jsonl",
 )
 

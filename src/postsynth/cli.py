@@ -7,6 +7,7 @@ from typing import Annotated
 import typer
 from rich.console import Console
 from rich.table import Table
+from tqdm import tqdm
 
 from postsynth.config import GenerationConfig, OpenRouterConfig, OutputConfig
 from postsynth.generator import Synthesizer
@@ -40,6 +41,9 @@ def _generate_command(
     refresh_models: bool,
     temperature: float,
     max_tokens: int,
+    batch_size: int,
+    max_batches: int | None,
+    no_progress: bool,
     no_dataset_card: bool,
 ) -> None:
     if bool(seed) == bool(examples):
@@ -76,17 +80,26 @@ def _generate_command(
         model_metadata=model_selection.metadata(),
     )
     try:
-        result = Synthesizer(provider_config=provider_config).generate(
-            kind,
-            seed=seed,
-            examples=example_rows,
-            generation_config=GenerationConfig(
-                count=count,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            ),
-            output_config=OutputConfig(path=out, write_dataset_card=not no_dataset_card),
-        )
+        with tqdm(
+            total=count,
+            unit="row",
+            desc=f"Generating {kind.upper()}",
+            disable=no_progress,
+        ) as progress:
+            result = Synthesizer(provider_config=provider_config).generate(
+                kind,
+                seed=seed,
+                examples=example_rows,
+                generation_config=GenerationConfig(
+                    count=count,
+                    batch_size=batch_size,
+                    max_batches=max_batches,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                ),
+                output_config=OutputConfig(path=out, write_dataset_card=not no_dataset_card),
+                progress_callback=progress.update,
+            )
     except RuntimeError as error:
         console.print(f"Error: {error}")
         raise typer.Exit(1) from error
@@ -141,6 +154,22 @@ CommonMaxTokens = Annotated[
     int,
     typer.Option("--max-tokens", min=1, help="Maximum completion tokens."),
 ]
+CommonBatchSize = Annotated[
+    int,
+    typer.Option("--batch-size", min=1, help="Rows to request per model call."),
+]
+CommonMaxBatches = Annotated[
+    int | None,
+    typer.Option(
+        "--max-batches",
+        min=1,
+        help="Maximum model-call batches before stopping short.",
+    ),
+]
+CommonNoProgress = Annotated[
+    bool,
+    typer.Option("--no-progress", help="Disable the tqdm progress bar."),
+]
 CommonNoCard = Annotated[
     bool,
     typer.Option("--no-dataset-card", help="Skip writing the sibling dataset card."),
@@ -159,6 +188,9 @@ def generate_sft(
     refresh_models: CommonRefreshModels = False,
     temperature: CommonTemperature = 0.7,
     max_tokens: CommonMaxTokens = 4096,
+    batch_size: CommonBatchSize = 25,
+    max_batches: CommonMaxBatches = None,
+    no_progress: CommonNoProgress = False,
     no_dataset_card: CommonNoCard = False,
 ) -> None:
     _generate_command(
@@ -173,6 +205,9 @@ def generate_sft(
         refresh_models=refresh_models,
         temperature=temperature,
         max_tokens=max_tokens,
+        batch_size=batch_size,
+        max_batches=max_batches,
+        no_progress=no_progress,
         no_dataset_card=no_dataset_card,
     )
 
@@ -189,6 +224,9 @@ def generate_dpo(
     refresh_models: CommonRefreshModels = False,
     temperature: CommonTemperature = 0.7,
     max_tokens: CommonMaxTokens = 4096,
+    batch_size: CommonBatchSize = 25,
+    max_batches: CommonMaxBatches = None,
+    no_progress: CommonNoProgress = False,
     no_dataset_card: CommonNoCard = False,
 ) -> None:
     _generate_command(
@@ -203,6 +241,9 @@ def generate_dpo(
         refresh_models=refresh_models,
         temperature=temperature,
         max_tokens=max_tokens,
+        batch_size=batch_size,
+        max_batches=max_batches,
+        no_progress=no_progress,
         no_dataset_card=no_dataset_card,
     )
 
@@ -219,6 +260,9 @@ def generate_grpo(
     refresh_models: CommonRefreshModels = False,
     temperature: CommonTemperature = 0.7,
     max_tokens: CommonMaxTokens = 4096,
+    batch_size: CommonBatchSize = 25,
+    max_batches: CommonMaxBatches = None,
+    no_progress: CommonNoProgress = False,
     no_dataset_card: CommonNoCard = False,
 ) -> None:
     _generate_command(
@@ -233,6 +277,9 @@ def generate_grpo(
         refresh_models=refresh_models,
         temperature=temperature,
         max_tokens=max_tokens,
+        batch_size=batch_size,
+        max_batches=max_batches,
+        no_progress=no_progress,
         no_dataset_card=no_dataset_card,
     )
 
@@ -249,6 +296,9 @@ def generate_kto(
     refresh_models: CommonRefreshModels = False,
     temperature: CommonTemperature = 0.7,
     max_tokens: CommonMaxTokens = 4096,
+    batch_size: CommonBatchSize = 25,
+    max_batches: CommonMaxBatches = None,
+    no_progress: CommonNoProgress = False,
     no_dataset_card: CommonNoCard = False,
 ) -> None:
     _generate_command(
@@ -263,6 +313,9 @@ def generate_kto(
         refresh_models=refresh_models,
         temperature=temperature,
         max_tokens=max_tokens,
+        batch_size=batch_size,
+        max_batches=max_batches,
+        no_progress=no_progress,
         no_dataset_card=no_dataset_card,
     )
 
