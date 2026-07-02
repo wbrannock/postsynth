@@ -17,3 +17,6 @@ wheels/
 # Generated datasets
 data/generated/
 outputs/
+
+# Docs build output
+site/
