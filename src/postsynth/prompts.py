@@ -34,6 +34,7 @@ Required row format:
 {ROW_DESCRIPTIONS[kind]}
 
 Quality requirements:
+- Return minified JSON on a single line with no indentation or extra whitespace.
 - Use conversational TRL message arrays.
 - Keep prompts realistic and useful for post-training.
 - Avoid duplicate rows.
@@ -58,6 +59,7 @@ Repair the JSON for a "{kind}" TRL dataset generation response.
 Return only a JSON object with exactly this shape:
 {{"items": [ ... ]}}
 
+Return minified JSON on a single line with no indentation or extra whitespace.
 It must contain exactly {count} valid items.
 Required row format:
 {ROW_DESCRIPTIONS[kind]}

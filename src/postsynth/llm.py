@@ -1,13 +1,30 @@
 from __future__ import annotations
 
 import os
+import threading
+import time
+from dataclasses import dataclass
 from typing import Protocol
 
 from dotenv import load_dotenv
-from openai import OpenAI
-from tenacity import retry, stop_after_attempt, wait_exponential
+from openai import OpenAI, RateLimitError
+from tenacity import (
+    RetryCallState,
+    retry,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 from postsynth.config import OpenRouterConfig
+
+RATE_LIMIT_MAX_ATTEMPTS = 5
+RATE_LIMIT_MAX_WAIT_SECONDS = 30.0
+
+
+@dataclass(frozen=True)
+class LLMResponse:
+    content: str
+    truncated: bool = False
 
 
 class LLMClient(Protocol):
@@ -18,8 +35,42 @@ class LLMClient(Protocol):
         model: str,
         temperature: float,
         max_tokens: int,
-    ) -> str:
+    ) -> str | LLMResponse:
         ...
+
+
+class _Cooldown:
+    """Shared pause gate so concurrent workers back off together after a 429."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._pause_until = 0.0
+
+    def wait(self) -> None:
+        while True:
+            with self._lock:
+                delay = self._pause_until - time.monotonic()
+            if delay <= 0:
+                return
+            time.sleep(delay)
+
+    def pause_for(self, seconds: float) -> None:
+        deadline = time.monotonic() + max(0.0, seconds)
+        with self._lock:
+            self._pause_until = max(self._pause_until, deadline)
+
+
+def _retry_after_seconds(error: RateLimitError) -> float | None:
+    response = getattr(error, "response", None)
+    if response is None:
+        return None
+    retry_after = response.headers.get("Retry-After")
+    if retry_after is None:
+        return None
+    try:
+        return max(0.0, float(retry_after))
+    except ValueError:
+        return None
 
 
 class OpenRouterClient:
@@ -41,7 +92,9 @@ class OpenRouterClient:
             base_url=self.config.base_url,
             default_headers=headers,
             timeout=self.config.timeout_seconds,
+            max_retries=0,  # tenacity below is the single retry layer
         )
+        self._cooldown = _Cooldown()
 
     def complete(
         self,
@@ -50,25 +103,50 @@ class OpenRouterClient:
         model: str,
         temperature: float,
         max_tokens: int,
-    ) -> str:
+    ) -> LLMResponse:
         attempts = max(1, self.config.max_retries + 1)
+        default_wait = wait_exponential(multiplier=1, min=1, max=8)
+        rate_limit_wait = wait_exponential(multiplier=1, min=1, max=RATE_LIMIT_MAX_WAIT_SECONDS)
 
-        @retry(
-            stop=stop_after_attempt(attempts),
-            wait=wait_exponential(multiplier=1, min=1, max=8),
-            reraise=True,
-        )
-        def _call() -> str:
+        def _stop(state: RetryCallState) -> bool:
+            limit = (
+                max(attempts, RATE_LIMIT_MAX_ATTEMPTS)
+                if isinstance(state.outcome.exception(), RateLimitError)
+                else attempts
+            )
+            return state.attempt_number >= limit
+
+        def _wait(state: RetryCallState) -> float:
+            error = state.outcome.exception()
+            if isinstance(error, RateLimitError):
+                seconds = _retry_after_seconds(error)
+                if seconds is None:
+                    seconds = rate_limit_wait(state)
+                self._cooldown.pause_for(seconds)
+                # The cooldown gate does the actual waiting, shared across threads.
+                return 0.0
+            return default_wait(state)
+
+        create_kwargs: dict[str, object] = {}
+        if self.config.reasoning_effort:
+            create_kwargs["extra_body"] = {
+                "reasoning": {"effort": self.config.reasoning_effort}
+            }
+
+        @retry(stop=_stop, wait=_wait, reraise=True)
+        def _call() -> LLMResponse:
+            self._cooldown.wait()
             response = self._client.chat.completions.create(
                 model=model,
                 messages=messages,  # type: ignore[arg-type]
                 temperature=temperature,
                 max_tokens=max_tokens,
+                **create_kwargs,  # type: ignore[arg-type]
             )
-            content = response.choices[0].message.content
+            choice = response.choices[0]
+            content = choice.message.content
             if not content:
                 raise RuntimeError("OpenRouter returned an empty response")
-            return content
+            return LLMResponse(content=content, truncated=choice.finish_reason == "length")
 
         return _call()
-

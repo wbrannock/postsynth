@@ -40,9 +40,10 @@ def _generate_command(
     allow_floating_model: bool,
     refresh_models: bool,
     temperature: float,
-    max_tokens: int,
+    max_tokens: int | None,
     batch_size: int,
     max_batches: int | None,
+    concurrency: int,
     no_progress: bool,
     no_dataset_card: bool,
 ) -> None:
@@ -96,6 +97,7 @@ def _generate_command(
                     max_batches=max_batches,
                     temperature=temperature,
                     max_tokens=max_tokens,
+                    concurrency=concurrency,
                 ),
                 output_config=OutputConfig(path=out, write_dataset_card=not no_dataset_card),
                 progress_callback=progress.update,
@@ -108,6 +110,8 @@ def _generate_command(
     )
     if result.dropped_rows:
         console.print(f"Dropped {result.dropped_rows} rows after validation.")
+    if result.failed_batches:
+        console.print(f"{result.failed_batches} batch request(s) failed; see the dataset card.")
 
 
 CommonSeed = Annotated[
@@ -151,8 +155,12 @@ CommonTemperature = Annotated[
     typer.Option("--temperature", min=0.0, max=2.0, help="Sampling temperature."),
 ]
 CommonMaxTokens = Annotated[
-    int,
-    typer.Option("--max-tokens", min=1, help="Maximum completion tokens."),
+    int | None,
+    typer.Option(
+        "--max-tokens",
+        min=1,
+        help="Maximum completion tokens per request. Defaults to scaling with batch size.",
+    ),
 ]
 CommonBatchSize = Annotated[
     int,
@@ -164,6 +172,14 @@ CommonMaxBatches = Annotated[
         "--max-batches",
         min=1,
         help="Maximum model-call batches before stopping short.",
+    ),
+]
+CommonConcurrency = Annotated[
+    int,
+    typer.Option(
+        "--concurrency",
+        min=1,
+        help="Concurrent generation batches in flight. Higher values may hit OpenRouter rate limits.",
     ),
 ]
 CommonNoProgress = Annotated[
@@ -187,9 +203,10 @@ def generate_sft(
     allow_floating_model: CommonAllowFloating = False,
     refresh_models: CommonRefreshModels = False,
     temperature: CommonTemperature = 0.7,
-    max_tokens: CommonMaxTokens = 4096,
+    max_tokens: CommonMaxTokens = None,
     batch_size: CommonBatchSize = 25,
     max_batches: CommonMaxBatches = None,
+    concurrency: CommonConcurrency = 4,
     no_progress: CommonNoProgress = False,
     no_dataset_card: CommonNoCard = False,
 ) -> None:
@@ -207,6 +224,7 @@ def generate_sft(
         max_tokens=max_tokens,
         batch_size=batch_size,
         max_batches=max_batches,
+        concurrency=concurrency,
         no_progress=no_progress,
         no_dataset_card=no_dataset_card,
     )
@@ -223,9 +241,10 @@ def generate_dpo(
     allow_floating_model: CommonAllowFloating = False,
     refresh_models: CommonRefreshModels = False,
     temperature: CommonTemperature = 0.7,
-    max_tokens: CommonMaxTokens = 4096,
+    max_tokens: CommonMaxTokens = None,
     batch_size: CommonBatchSize = 25,
     max_batches: CommonMaxBatches = None,
+    concurrency: CommonConcurrency = 4,
     no_progress: CommonNoProgress = False,
     no_dataset_card: CommonNoCard = False,
 ) -> None:
@@ -243,6 +262,7 @@ def generate_dpo(
         max_tokens=max_tokens,
         batch_size=batch_size,
         max_batches=max_batches,
+        concurrency=concurrency,
         no_progress=no_progress,
         no_dataset_card=no_dataset_card,
     )
@@ -259,9 +279,10 @@ def generate_grpo(
     allow_floating_model: CommonAllowFloating = False,
     refresh_models: CommonRefreshModels = False,
     temperature: CommonTemperature = 0.7,
-    max_tokens: CommonMaxTokens = 4096,
+    max_tokens: CommonMaxTokens = None,
     batch_size: CommonBatchSize = 25,
     max_batches: CommonMaxBatches = None,
+    concurrency: CommonConcurrency = 4,
     no_progress: CommonNoProgress = False,
     no_dataset_card: CommonNoCard = False,
 ) -> None:
@@ -279,6 +300,7 @@ def generate_grpo(
         max_tokens=max_tokens,
         batch_size=batch_size,
         max_batches=max_batches,
+        concurrency=concurrency,
         no_progress=no_progress,
         no_dataset_card=no_dataset_card,
     )
@@ -295,9 +317,10 @@ def generate_kto(
     allow_floating_model: CommonAllowFloating = False,
     refresh_models: CommonRefreshModels = False,
     temperature: CommonTemperature = 0.7,
-    max_tokens: CommonMaxTokens = 4096,
+    max_tokens: CommonMaxTokens = None,
     batch_size: CommonBatchSize = 25,
     max_batches: CommonMaxBatches = None,
+    concurrency: CommonConcurrency = 4,
     no_progress: CommonNoProgress = False,
     no_dataset_card: CommonNoCard = False,
 ) -> None:
@@ -315,6 +338,7 @@ def generate_kto(
         max_tokens=max_tokens,
         batch_size=batch_size,
         max_batches=max_batches,
+        concurrency=concurrency,
         no_progress=no_progress,
         no_dataset_card=no_dataset_card,
     )

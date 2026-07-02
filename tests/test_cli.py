@@ -33,6 +33,15 @@ def test_cli_rejects_model_and_model_preset() -> None:
     assert "Use either --model or --model-preset" in result.output
 
 
+def test_cli_rejects_non_positive_concurrency() -> None:
+    result = CliRunner().invoke(
+        app,
+        ["generate", "sft", "--seed", "math", "--concurrency", "0"],
+    )
+
+    assert result.exit_code != 0
+
+
 def test_models_presets_command() -> None:
     result = CliRunner().invoke(app, ["models", "presets"])
 

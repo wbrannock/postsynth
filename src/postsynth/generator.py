@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
@@ -8,12 +9,15 @@ from typing import Any, Callable
 from pydantic import BaseModel, ValidationError
 
 from postsynth.config import GenerationConfig, OpenRouterConfig, OutputConfig
-from postsynth.json_utils import parse_json_object
-from postsynth.llm import LLMClient, OpenRouterClient
+from postsynth.json_utils import parse_json_object, salvage_json_object
+from postsynth.llm import LLMClient, LLMResponse, OpenRouterClient
 from postsynth.models import resolve_model_selection
 from postsynth.prompts import build_generation_messages, build_repair_messages
 from postsynth.schemas import DatasetKind, GeneratedItems, ROW_ADAPTERS
 from postsynth.writers import write_dataset_card, write_jsonl
+
+ROW_TOKEN_BUDGET = 400
+COMPLETION_TOKEN_HEADROOM = 2048
 
 
 @dataclass(frozen=True)
@@ -27,6 +31,7 @@ class GenerationResult:
     repair_succeeded: int
     dropped_rows: int
     batches_attempted: int
+    failed_batches: int
     incomplete: bool
     batch_diagnostics: list[dict[str, Any]]
 
@@ -73,6 +78,7 @@ class Synthesizer:
             "repair_succeeded": 0,
             "dropped_rows": 0,
             "batches_attempted": 0,
+            "failed_batches": 0,
             "incomplete": 0,
         }
         batch_diagnostics: list[dict[str, Any]] = []
@@ -81,48 +87,119 @@ class Synthesizer:
             generation_config.batch_size,
         )
 
-        while len(rows) < generation_config.count and stats["batches_attempted"] < max_batches:
-            remaining = generation_config.count - len(rows)
-            batch_count = min(remaining, generation_config.batch_size)
-            batch_config = replace(generation_config, count=batch_count)
-            batch_index = stats["batches_attempted"] + 1
-            messages = build_generation_messages(
-                kind,
-                count=batch_count,
-                seed=seed,
-                examples=examples,
-            )
-            response = self.llm_client.complete(
-                messages,
-                model=self.provider_config.model,
-                temperature=generation_config.temperature,
-                max_tokens=generation_config.max_tokens,
-            )
-            batch_rows, batch_stats = self._parse_validate_repair(
-                kind,
-                response=response,
-                generation_config=batch_config,
-            )
-            rows.extend(batch_rows)
-            for key in ("invalid_rows", "repair_attempted", "repair_succeeded", "dropped_rows"):
-                stats[key] += batch_stats[key]
-            stats["batches_attempted"] += 1
-            batch_diagnostics.append(
-                {
-                    "batch": batch_index,
-                    "requested": batch_count,
-                    "accepted": len(batch_rows),
-                    "dropped": batch_stats["dropped_rows"],
-                    "invalid_rows": batch_stats["invalid_rows"],
-                    "repair_attempted": batch_stats["repair_attempted"],
-                    "repair_succeeded": batch_stats["repair_succeeded"],
-                    "error_stage": batch_stats["error_stage"],
-                    "error_summary": batch_stats["error_summary"],
-                }
-            )
-            if progress_callback:
-                progress_callback(len(batch_rows))
+        messages_cache: dict[int, list[dict[str, str]]] = {}
 
+        def _messages_for(batch_count: int) -> list[dict[str, str]]:
+            if batch_count not in messages_cache:
+                messages_cache[batch_count] = build_generation_messages(
+                    kind,
+                    count=batch_count,
+                    seed=seed,
+                    examples=examples,
+                )
+            return messages_cache[batch_count]
+
+        # All shared state below is mutated only by this (collector) thread;
+        # workers run _run_batch, which touches nothing shared.
+        in_flight: dict[Future, tuple[int, int]] = {}
+        batches_dispatched = 0
+        last_exception: BaseException | None = None
+        any_batch_succeeded = False
+
+        def _can_dispatch() -> bool:
+            expected = len(rows) + sum(count for _, count in in_flight.values())
+            return (
+                expected < generation_config.count
+                and batches_dispatched < max_batches
+                and len(in_flight) < generation_config.concurrency
+                and not (last_exception is not None and not any_batch_succeeded)
+            )
+
+        with ThreadPoolExecutor(max_workers=generation_config.concurrency) as executor:
+
+            def _dispatch_one() -> None:
+                nonlocal batches_dispatched
+                expected = len(rows) + sum(count for _, count in in_flight.values())
+                batch_count = min(
+                    generation_config.count - expected,
+                    generation_config.batch_size,
+                )
+                batches_dispatched += 1
+                batch_config = replace(generation_config, count=batch_count)
+                future = executor.submit(
+                    self._run_batch,
+                    kind,
+                    messages=_messages_for(batch_count),
+                    batch_config=batch_config,
+                )
+                in_flight[future] = (batches_dispatched, batch_count)
+
+            try:
+                while _can_dispatch():
+                    _dispatch_one()
+                while in_flight:
+                    done, _ = wait(in_flight, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        batch_index, batch_count = in_flight.pop(future)
+                        error = future.exception()
+                        stats["batches_attempted"] += 1
+                        if error is not None:
+                            last_exception = error
+                            stats["failed_batches"] += 1
+                            stats["dropped_rows"] += batch_count
+                            batch_diagnostics.append(
+                                {
+                                    "batch": batch_index,
+                                    "requested": batch_count,
+                                    "accepted": 0,
+                                    "dropped": batch_count,
+                                    "invalid_rows": 0,
+                                    "repair_attempted": 0,
+                                    "repair_succeeded": 0,
+                                    "truncated": False,
+                                    "error_stage": "request_failure",
+                                    "error_summary": _truncate_summary(str(error)),
+                                }
+                            )
+                            if progress_callback:
+                                progress_callback(0)
+                            continue
+                        any_batch_succeeded = True
+                        batch_rows, batch_stats = future.result()
+                        rows.extend(batch_rows)
+                        for key in (
+                            "invalid_rows",
+                            "repair_attempted",
+                            "repair_succeeded",
+                            "dropped_rows",
+                        ):
+                            stats[key] += batch_stats[key]
+                        batch_diagnostics.append(
+                            {
+                                "batch": batch_index,
+                                "requested": batch_count,
+                                "accepted": len(batch_rows),
+                                "dropped": batch_stats["dropped_rows"],
+                                "invalid_rows": batch_stats["invalid_rows"],
+                                "repair_attempted": batch_stats["repair_attempted"],
+                                "repair_succeeded": batch_stats["repair_succeeded"],
+                                "truncated": batch_stats["truncated"],
+                                "error_stage": batch_stats["error_stage"],
+                                "error_summary": batch_stats["error_summary"],
+                            }
+                        )
+                        if progress_callback:
+                            progress_callback(len(batch_rows))
+                    while _can_dispatch():
+                        _dispatch_one()
+            except BaseException:
+                executor.shutdown(wait=False, cancel_futures=True)
+                raise
+
+        if last_exception is not None and not any_batch_succeeded:
+            raise RuntimeError("all generation batches failed") from last_exception
+
+        batch_diagnostics.sort(key=lambda diagnostic: diagnostic["batch"])
         rows = rows[: generation_config.count]
         if len(rows) < generation_config.count:
             stats["incomplete"] = 1
@@ -148,8 +225,31 @@ class Synthesizer:
             repair_succeeded=stats["repair_succeeded"],
             dropped_rows=stats["dropped_rows"],
             batches_attempted=stats["batches_attempted"],
+            failed_batches=stats["failed_batches"],
             incomplete=bool(stats["incomplete"]),
             batch_diagnostics=batch_diagnostics,
+        )
+
+    def _run_batch(
+        self,
+        kind: DatasetKind,
+        *,
+        messages: list[dict[str, str]],
+        batch_config: GenerationConfig,
+    ) -> tuple[list[BaseModel], dict[str, Any]]:
+        response, truncated = _response_parts(
+            self.llm_client.complete(
+                messages,
+                model=self.provider_config.model,
+                temperature=batch_config.temperature,
+                max_tokens=_resolve_max_tokens(batch_config),
+            )
+        )
+        return self._parse_validate_repair(
+            kind,
+            response=response,
+            truncated=truncated,
+            generation_config=batch_config,
         )
 
     def _parse_validate_repair(
@@ -158,12 +258,15 @@ class Synthesizer:
         *,
         response: str,
         generation_config: GenerationConfig,
+        truncated: bool = False,
     ) -> tuple[list[BaseModel], dict[str, Any]]:
-        rows, invalid = _parse_and_validate_rows(kind, response)
+        rows, invalid = _parse_and_validate_rows(kind, response, allow_salvage=truncated)
         repair_attempted = 0
         repair_succeeded = 0
 
-        if invalid and generation_config.repair_attempts > 0:
+        # Repairing a truncated response is doomed: the repair prompt embeds the
+        # cut-off output and the full corrected JSON cannot fit either.
+        if invalid and not truncated and generation_config.repair_attempts > 0:
             repair_attempted = 1
             repair_messages = build_repair_messages(
                 kind,
@@ -171,13 +274,17 @@ class Synthesizer:
                 validation_error=_format_invalid_rows(invalid),
                 count=generation_config.count,
             )
-            repaired = self.llm_client.complete(
-                repair_messages,
-                model=self.provider_config.model,
-                temperature=0.0,
-                max_tokens=generation_config.max_tokens,
+            repaired, repair_truncated = _response_parts(
+                self.llm_client.complete(
+                    repair_messages,
+                    model=self.provider_config.model,
+                    temperature=0.0,
+                    max_tokens=_resolve_max_tokens(generation_config),
+                )
             )
-            rows, invalid = _parse_and_validate_rows(kind, repaired)
+            rows, invalid = _parse_and_validate_rows(
+                kind, repaired, allow_salvage=repair_truncated
+            )
             repair_succeeded = 1 if not invalid else 0
 
         rows = rows[: generation_config.count]
@@ -187,6 +294,7 @@ class Synthesizer:
             "repair_attempted": repair_attempted,
             "repair_succeeded": repair_succeeded,
             "dropped_rows": dropped_rows,
+            "truncated": truncated,
             "error_stage": _error_stage(invalid),
             "error_summary": _error_summary(invalid),
         }
@@ -201,6 +309,7 @@ def generate_sft(
     count: int,
     batch_size: int = 25,
     max_batches: int | None = None,
+    concurrency: int = 1,
     provider_config: OpenRouterConfig | None = None,
     llm_client: LLMClient | None = None,
 ) -> GenerationResult:
@@ -212,6 +321,7 @@ def generate_sft(
         count=count,
         batch_size=batch_size,
         max_batches=max_batches,
+        concurrency=concurrency,
         provider_config=provider_config,
         llm_client=llm_client,
     )
@@ -225,6 +335,7 @@ def generate_dpo(
     count: int,
     batch_size: int = 25,
     max_batches: int | None = None,
+    concurrency: int = 1,
     provider_config: OpenRouterConfig | None = None,
     llm_client: LLMClient | None = None,
 ) -> GenerationResult:
@@ -236,6 +347,7 @@ def generate_dpo(
         count=count,
         batch_size=batch_size,
         max_batches=max_batches,
+        concurrency=concurrency,
         provider_config=provider_config,
         llm_client=llm_client,
     )
@@ -249,6 +361,7 @@ def generate_grpo(
     count: int,
     batch_size: int = 25,
     max_batches: int | None = None,
+    concurrency: int = 1,
     provider_config: OpenRouterConfig | None = None,
     llm_client: LLMClient | None = None,
 ) -> GenerationResult:
@@ -260,6 +373,7 @@ def generate_grpo(
         count=count,
         batch_size=batch_size,
         max_batches=max_batches,
+        concurrency=concurrency,
         provider_config=provider_config,
         llm_client=llm_client,
     )
@@ -273,6 +387,7 @@ def generate_kto(
     count: int,
     batch_size: int = 25,
     max_batches: int | None = None,
+    concurrency: int = 1,
     provider_config: OpenRouterConfig | None = None,
     llm_client: LLMClient | None = None,
 ) -> GenerationResult:
@@ -284,6 +399,7 @@ def generate_kto(
         count=count,
         batch_size=batch_size,
         max_batches=max_batches,
+        concurrency=concurrency,
         provider_config=provider_config,
         llm_client=llm_client,
     )
@@ -298,6 +414,7 @@ def _generate_kind(
     count: int,
     batch_size: int,
     max_batches: int | None,
+    concurrency: int,
     provider_config: OpenRouterConfig | None,
     llm_client: LLMClient | None,
 ) -> GenerationResult:
@@ -310,6 +427,7 @@ def _generate_kind(
             count=count,
             batch_size=batch_size,
             max_batches=max_batches,
+            concurrency=concurrency,
         ),
         output_config=OutputConfig(path=Path(output_path)),
     )
@@ -331,12 +449,31 @@ def _parse_generated_items(response: str) -> GeneratedItems:
 def _parse_and_validate_rows(
     kind: DatasetKind,
     response: str,
+    *,
+    allow_salvage: bool = False,
 ) -> tuple[list[BaseModel], list[tuple[int, str]]]:
     try:
         parsed = _parse_generated_items(response)
     except (ValueError, ValidationError) as error:
-        return [], [(-1, str(error))]
+        if not allow_salvage:
+            return [], [(-1, str(error))]
+        try:
+            parsed = GeneratedItems.model_validate(salvage_json_object(response))
+        except (ValueError, ValidationError):
+            return [], [(-1, str(error))]
     return _validate_rows(kind, parsed.items)
+
+
+def _response_parts(response: str | LLMResponse) -> tuple[str, bool]:
+    if isinstance(response, LLMResponse):
+        return response.content, response.truncated
+    return response, False
+
+
+def _resolve_max_tokens(config: GenerationConfig) -> int:
+    if config.max_tokens is not None:
+        return config.max_tokens
+    return ROW_TOKEN_BUDGET * config.count + COMPLETION_TOKEN_HEADROOM
 
 
 def _validate_rows(
@@ -378,7 +515,11 @@ def _error_stage(invalid: list[tuple[int, str]]) -> str | None:
 def _error_summary(invalid: list[tuple[int, str]]) -> str | None:
     if not invalid:
         return None
-    summary = invalid[0][1].replace("\n", " ")
+    return _truncate_summary(invalid[0][1])
+
+
+def _truncate_summary(text: str) -> str:
+    summary = text.replace("\n", " ")
     if len(summary) > 300:
         return summary[:297] + "..."
     return summary

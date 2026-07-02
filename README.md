@@ -2,6 +2,9 @@
 
 Generate synthetic post-training datasets in TRL-native formats.
 
+Full documentation lives in [`docs/`](docs/index.md) — build it locally with
+`uv run mkdocs serve`.
+
 `postsynth` v1 focuses on conversational JSONL rows for common TRL workflows:
 
 - SFT: `messages`
@@ -41,6 +44,7 @@ postsynth generate sft \
   --count 100 \
   --batch-size 25 \
   --max-batches 20 \
+  --concurrency 4 \
   --out data/generated/sft.jsonl
 ```
 
@@ -99,16 +103,23 @@ The CLI writes a JSONL dataset and a sibling dataset card, for example
 resolved model, model source, floating-model status, and catalog metadata when
 available.
 
-Large generations run in batches and show a tqdm progress bar by default. The
-progress bar advances when valid rows are accepted, not merely when a request
-finishes. If a batch returns malformed JSON or too few valid rows, postsynth keeps
-requesting fill batches until it reaches `--count` or exhausts the attempt
-budget.
+Large generations run in batches, with up to `--concurrency` batches in flight
+at once (CLI default 4; the Python API defaults to `concurrency=1`). OpenRouter
+rate limits are handled automatically — rate-limited requests back off together
+and honour `Retry-After` — but under sustained limiting a run can only go as
+fast as your account allows, so lower `--concurrency` if you see repeated 429s.
+
+The tqdm progress bar advances when valid rows are accepted, not merely when a
+request finishes. If a batch returns malformed JSON, too few valid rows, or a
+failed request, postsynth keeps requesting fill batches until it reaches
+`--count` or exhausts the attempt budget. The completion token budget scales
+with `--batch-size` automatically; pass `--max-tokens` to override it.
 
 Tune request size with `--batch-size`, cap total model calls with
 `--max-batches`, or disable progress output in scripts with `--no-progress`.
 Dataset cards include aggregate validation stats and per-batch diagnostics so
-you can see which batches were accepted, repaired, dropped, or left incomplete.
+you can see which batches were accepted, repaired, truncated, dropped, or
+failed.
 
 ## Python API
 
@@ -119,6 +130,7 @@ result = generate_sft(
     seed="Math tutoring conversations for middle-school students.",
     count=25,
     batch_size=5,
+    concurrency=4,
     output_path="data/generated/math_sft.jsonl",
 )
 
